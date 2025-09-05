@@ -1,0 +1,7 @@
+{
+  "name": "hello-bin",
+  "version": "1.0.0",
+  "summary": "Hello World! (binary)",
+  "binaries": ["hello"],
+  "dependencies": []
+}

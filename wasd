@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+wasd - tiny AUR-like client prototype
+Supports source packages (build+install) and binary-only packages.
+"""
+import argparse, json, os, sys, tempfile, shutil, hashlib, tarfile, subprocess, urllib.request, urllib.parse
+
+# ------------------------
+# Configuration
+# ------------------------
+DEFAULT_INDEX = "http://localhost:8080/index.json"
+CACHE_DIR = os.path.expanduser("~/.local/share/wasd")
+PKG_CACHE = os.path.join(CACHE_DIR, "pkgs")
+INDEX_CACHE = os.path.join(CACHE_DIR, "index.json")
+INSTALL_PREFIX_USER = os.path.expanduser("~/.local/bin")  # default binary install prefix
+
+os.makedirs(PKG_CACHE, exist_ok=True)
+os.makedirs(os.path.dirname(INDEX_CACHE), exist_ok=True)
+
+# ------------------------
+# Utilities
+# ------------------------
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path,'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def download(url, out):
+    print(f"Downloading {url} -> {out}")
+    urllib.request.urlretrieve(url, out)
+
+def load_index(path=INDEX_CACHE):
+    if not os.path.exists(path):
+        return {"packages": {}}
+    with open(path,'r') as f:
+        return json.load(f)
+
+def save_index(idx, path=INDEX_CACHE):
+    with open(path,'w') as f:
+        json.dump(idx, f, indent=2, sort_keys=True)
+
+# ------------------------
+# Commands
+# ------------------------
+def cmd_sync(args):
+    url = args.index or DEFAULT_INDEX
+    print(f"Syncing index from {url}")
+    tmp = INDEX_CACHE + ".tmp"
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        shutil.move(tmp, INDEX_CACHE)
+        print("Index synced.")
+    except Exception as e:
+        print("Failed to sync index:", e)
+        if os.path.exists(tmp): os.remove(tmp)
+
+def cmd_search(args):
+    idx = load_index()
+    q = args.query.lower()
+    hits = []
+    for name, versions in idx.get("packages", {}).items():
+        if q in name.lower() or any(q in (v.get("summary","").lower()) for _,v in versions.items()):
+            latest = sorted(versions.keys(), key=lambda s: list(map(int, s.split('.'))))[-1]
+            hits.append((name, latest, versions[latest].get("summary","")))
+    if not hits:
+        print("No packages found.")
+        return
+    for n,v,s in hits:
+        print(f"{n} {v} - {s}")
+
+def ensure_index_local():
+    if not os.path.exists(INDEX_CACHE):
+        print("Index not found locally. Run `wasd sync` first or specify --index.")
+        sys.exit(1)
+    return load_index()
+
+def resolve_pkg(idx, pkg_name):
+    pkgs = idx.get("packages", {})
+    if pkg_name not in pkgs:
+        print("Package not found:", pkg_name); sys.exit(1)
+    versions = pkgs[pkg_name]
+    chosen = sorted(versions.keys(), key=lambda s: list(map(int, s.split('.'))))[-1]
+    return chosen, versions[chosen]
+
+def run_build_and_install(extracted_dir, pkgmeta, prefix):
+    build_cmds = pkgmeta.get("build", [])
+    install_cmds = pkgmeta.get("install", [])
+    env = os.environ.copy()
+    env["PREFIX"] = prefix
+    print("Running build commands:")
+    for cmd in build_cmds:
+        print(">", cmd)
+        subprocess.check_call(cmd, shell=True, cwd=extracted_dir, env=env)
+    print("Running install commands:")
+    for cmd in install_cmds:
+        cmdf = cmd.format(prefix=prefix)
+        print(">", cmdf)
+        subprocess.check_call(cmdf, shell=True, cwd=extracted_dir, env=env)
+
+def cmd_install(args):
+    idx = ensure_index_local()
+    pkg = args.pkg
+    version, info = resolve_pkg(idx, pkg)
+    url = info["url"]
+    sha = info.get("sha256")
+    fname = os.path.basename(urllib.parse.urlparse(url).path)
+    local_tar = os.path.join(PKG_CACHE, fname)
+    if not os.path.exists(local_tar):
+        download(url, local_tar)
+    if sha:
+        got = sha256_of_file(local_tar)
+        if got != sha:
+            print("SHA mismatch! expected", sha, "got", got)
+            sys.exit(1)
+    tmpd = tempfile.mkdtemp(prefix="wasd-")
+    try:
+        with tarfile.open(local_tar, "r:gz") as tar:
+            tar.extractall(tmpd)
+        meta_path = None
+        for root,_,files in os.walk(tmpd):
+            if "pkgmeta.json" in files:
+                meta_path = os.path.join(root,"pkgmeta.json")
+                break
+        if not meta_path:
+            print("pkgmeta.json not found in package"); sys.exit(1)
+        with open(meta_path,'r') as f:
+            meta = json.load(f)
+        if "sha256" in meta:
+            print("Warning: sha256 in pkgmeta.json will be ignored. Only index.json hash is used.")
+
+        prefix = args.prefix or INSTALL_PREFIX_USER
+
+        if "build" in meta:
+            # source package
+            os.makedirs(prefix, exist_ok=True)
+            run_build_and_install(os.path.dirname(meta_path), meta, prefix)
+        elif "binaries" in meta:
+            # binary-only package
+            for bin_file in meta["binaries"]:
+                src = os.path.join(os.path.dirname(meta_path), bin_file)
+                if not os.path.exists(src):
+                    print(f"Binary {bin_file} not found in package!")
+                    sys.exit(1)
+                os.makedirs(prefix, exist_ok=True)
+                dst = os.path.join(prefix, os.path.basename(bin_file))
+                shutil.copy2(src, dst)
+                print(f"Installed binary {bin_file} -> {dst}")
+        else:
+            print("Error: pkgmeta.json must have either 'build' or 'binaries'.")
+            sys.exit(1)
+
+        print(f"Installed {pkg} {version} to {prefix}")
+    finally:
+        shutil.rmtree(tmpd)
+
+def cmd_publish(args):
+    srcdir = args.pkgdir
+    meta_path = os.path.join(srcdir, "pkgmeta.json")
+    if not os.path.exists(meta_path):
+        print("pkgmeta.json missing in", srcdir)
+        sys.exit(1)
+
+    with open(meta_path, 'r') as f:
+        meta = json.load(f)
+
+    if "sha256" in meta:
+        print("Warning: sha256 in pkgmeta.json will be ignored.")
+
+    name = meta["name"]
+    ver = meta["version"]
+    tarname = f"{name}-{ver}.tar.gz"
+    out = os.path.join(PKG_CACHE, tarname)
+
+    # create tarball
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(srcdir, arcname=os.path.basename(srcdir))
+
+    sha = sha256_of_file(out)
+
+    # -------------------------
+    # Merge into index.json
+    # -------------------------
+    if args.repo_dir:
+        repo_index_path = os.path.join(args.repo_dir, "index.json")
+        if os.path.exists(repo_index_path):
+            idx = load_index(repo_index_path)
+        else:
+            idx = {"packages": {}}
+    else:
+        idx = load_index()
+
+    pkgs = idx.setdefault("packages", {})
+    pkg_versions = pkgs.setdefault(name, {})
+
+    pkg_versions[ver] = {
+        "url": args.repo_base.rstrip('/') + "/packages/" + tarname,
+        "sha256": sha,
+        "summary": meta.get("summary", "")
+    }
+
+    # copy tarball to repo
+    if args.repo_dir:
+        dst_dir = os.path.join(args.repo_dir, "packages")
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy(out, os.path.join(dst_dir, tarname))
+        save_index(idx, repo_index_path)
+        print(f"Published {name} {ver} to repo dir: {args.repo_dir}")
+    else:
+        save_index(idx)
+        print(f"Published {name} {ver} locally")
+
+    print("sha256:", sha)
+
+
+# ------------------------
+# Main
+# ------------------------
+def main():
+    p = argparse.ArgumentParser(prog="wasd")
+    sp = p.add_subparsers(dest="cmd")
+    sp_sync = sp.add_parser("sync"); sp_sync.add_argument("--index", help="index url")
+    sp_search = sp.add_parser("search"); sp_search.add_argument("query")
+    sp_install = sp.add_parser("install"); sp_install.add_argument("pkg"); sp_install.add_argument("--prefix", help="install prefix")
+    sp_publish = sp.add_parser("publish")
+    sp_publish.add_argument("pkgdir")
+    sp_publish.add_argument("--repo-dir", help="copy package to repo dir")
+    sp_publish.add_argument("--repo-base", default="http://localhost:8080", help="base url where repo will be served")
+    args = p.parse_args()
+    if args.cmd == "sync": cmd_sync(args)
+    elif args.cmd == "search": cmd_search(args)
+    elif args.cmd == "install": cmd_install(args)
+    elif args.cmd == "publish": cmd_publish(args)
+    else: p.print_help()
+
+if __name__ == "__main__":
+    main()

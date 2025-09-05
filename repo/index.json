@@ -1,0 +1,18 @@
+{
+  "packages": {
+    "hello-bin": {
+      "1.0.0": {
+        "sha256": "8d525e64f17482208c69bf0389b19ebe57e550eb6ed8cd7a933a72bc381dff0b",
+        "summary": "Hello World! (binary)",
+        "url": "http://localhost:8080/packages/hello-bin-1.0.0.tar.gz"
+      }
+    },
+    "hello-src": {
+      "1.0.0": {
+        "sha256": "ea16f2d8169d88d6e01863de5cfc91c6db1dd8c149be8dca671a0e90e3a591c6",
+        "summary": "Hello World!",
+        "url": "http://localhost:8080/packages/hello-src-1.0.0.tar.gz"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "hello-src",
+  "version": "1.0.0",
+  "summary": "Hello World!",
+  "build": ["make"],
+  "install": ["make install PREFIX={prefix}"],
+  "dependencies": []
+}
